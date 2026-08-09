@@ -40,6 +40,22 @@ func registerHandlers(host *sdk.ServiceHost, svc *Service, log *slog.Logger) {
 		return proto.Marshal(&pkgv1.InstallResult{Package: toProto(info)})
 	})
 
+	// Inspect 只读：解包 + 验签 + 算出申请的 USER_CONSENT 权限清单，不装任何东西。
+	//
+	// 它是确认屏的数据来源。此前确认屏无从知道待装包申请了什么——List 与
+	// ListGrants 都只覆盖已装包，而待装的包还不在 Catalog 里。
+	host.Handle(methodInspect, func(cc sdk.CallContext, payload []byte) ([]byte, error) {
+		var req pkgv1.InspectRequest
+		if err := proto.Unmarshal(payload, &req); err != nil {
+			return nil, invalidArgument()
+		}
+		info, err := svc.InspectFromRelPath(req.GetNspkgRelpath())
+		if err != nil {
+			return nil, mapErr(err, log, "inspect")
+		}
+		return proto.Marshal(inspectToProto(info))
+	})
+
 	host.Handle(methodUninstal, func(cc sdk.CallContext, payload []byte) ([]byte, error) {
 		var req pkgv1.UninstallRequest
 		if err := proto.Unmarshal(payload, &req); err != nil {
@@ -100,6 +116,62 @@ func toProto(p *PackageInfo) *pkgv1.PackageInfo {
 		Source:             p.Source,
 		GrantedPermissions: p.Granted,
 		DisabledComponents: p.Disabled,
+	}
+}
+
+// inspectToProto 把 adminwire 的 InspectInfo 投影成接口层的 InspectResult。
+//
+// 与 toProto 同理不共用类型：那份是内核的内部投影，这份是给确认屏看的对外契约。
+//
+// 权限文案原样透传，【本服务不改一个字】：文案来自 Catalog 的权限定义，
+// 而第三方包可以定义自己的权限——在这里做任何补齐或替换，都会让用户看到的
+// 说明与内核实际裁决的那条权限对不上。
+func inspectToProto(in *InspectInfo) *pkgv1.InspectResult {
+	if in == nil {
+		return &pkgv1.InspectResult{}
+	}
+	out := &pkgv1.InspectResult{
+		PackageId:   in.ID,
+		Version:     in.Version,
+		VersionCode: in.VersionCode,
+		ConsentPermissions: make([]*pkgv1.RequestedPermission, 0,
+			len(in.ConsentPermissions)),
+	}
+	for i := range in.ConsentPermissions {
+		p := &in.ConsentPermissions[i]
+		out.ConsentPermissions = append(out.ConsentPermissions, &pkgv1.RequestedPermission{
+			PermissionId: p.ID,
+			DisplayName: &ipcv1.LocalizedText{
+				ZhCn: p.DisplayNameZhCN,
+				En:   p.DisplayNameEN,
+			},
+			Description: &ipcv1.LocalizedText{
+				ZhCn: p.DescriptionZhCN,
+				En:   p.DescriptionEN,
+			},
+			RiskClass: riskClassFromWire(p.RiskClass),
+		})
+	}
+	return out
+}
+
+// riskClassFromWire 把 adminwire 的风险等级字符串映射回 proto 枚举。
+//
+// 认不出来的一律回 UNSPECIFIED 而不是猜一个：确认屏按风险等级决定强调程度，
+// 把一条未知等级的权限显示成 NORMAL 会让用户低估它。UNSPECIFIED 让界面
+// 走「等级未知」那条保守分支。
+func riskClassFromWire(s string) ipcv1.RiskClass {
+	switch s {
+	case RiskClassNormal:
+		return ipcv1.RiskClass_RISK_CLASS_NORMAL
+	case RiskClassPrivacySensitive:
+		return ipcv1.RiskClass_RISK_CLASS_PRIVACY_SENSITIVE
+	case RiskClassPhysicalControl:
+		return ipcv1.RiskClass_RISK_CLASS_PHYSICAL_CONTROL
+	case RiskClassCriticalSafety:
+		return ipcv1.RiskClass_RISK_CLASS_CRITICAL_SAFETY
+	default:
+		return ipcv1.RiskClass_RISK_CLASS_UNSPECIFIED
 	}
 }
 

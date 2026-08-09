@@ -37,6 +37,7 @@ var (
 	methodUninstal = uint32(pkgv1.PackageManagerMethod_PACKAGE_MANAGER_METHOD_UNINSTALL)
 	methodList     = uint32(pkgv1.PackageManagerMethod_PACKAGE_MANAGER_METHOD_LIST)
 	methodSetComp  = uint32(pkgv1.PackageManagerMethod_PACKAGE_MANAGER_METHOD_SET_COMPONENT_ENABLED)
+	methodInspect  = uint32(pkgv1.PackageManagerMethod_PACKAGE_MANAGER_METHOD_INSPECT)
 )
 
 // Service 是 pkgmanagerd 的业务实现。
@@ -75,6 +76,63 @@ func (s *Service) InstallFromRelPath(relPath string, consented []string) (*Packa
 		return nil, err
 	}
 	return s.installFile(nspkgPath, consented)
+}
+
+// InspectFromRelPath 只读检视一个 .nspkg：解包到 staging，让 nervud 验签并算出
+// 它申请的 USER_CONSENT 权限清单。**不安装任何东西。**
+//
+// # 为什么它也要 staging + 解包
+//
+// nervud 要读的是包里的 manifest.json 与 manifest.sig，而它读不到本服务的私有
+// 数据目录（两个进程各自的沙箱）。交接位置只有 staging 这一处，因此哪怕只是
+// 「看一眼」也要走同一条解包流程。
+//
+// # staging 不会被消费
+//
+// install 成功时 nervud 用 renameat2 把 staging 移走；inspect 什么也不移。留下
+// 的目录由 nervud 在下一次 begin-staging 时清扫（超过一小时的孤儿）。本服务
+// 没有删它的权限，也不该有——那个目录属于 nervud 的掌控范围。
+//
+// 代价是「看一次再装一次」会解包两遍。那是对的：确认屏与安装是两次独立的用户
+// 决定，中间可能隔着很久，复用第一次的 staging 等于让一个待装包无限期占着
+// nervud 的 staging 根。
+func (s *Service) InspectFromRelPath(relPath string) (*InspectInfo, error) {
+	nspkgPath, err := resolveHandoff(relPath)
+	if err != nil {
+		return nil, err
+	}
+
+	begin, err := s.admin.Do(Request{Cmd: CmdBeginStaging})
+	if err != nil {
+		return nil, fmt.Errorf("begin-staging: %w", err)
+	}
+	if !begin.OK {
+		return nil, fmt.Errorf("begin-staging 被拒绝 (%s): %s", begin.Code, begin.Message)
+	}
+	staging := begin.StagingDir
+
+	// 解包：与 install 同一个 Unpack（防 tar-slip 那一道也同样生效）。
+	// 一个畸形包在这里就失败，确认屏因此不会显示任何来自它的内容
+	if err := Unpack(nspkgPath, staging); err != nil {
+		s.log.Warn("pkgmanager: inspect unpack failed", "nspkg", nspkgPath, "err", err)
+		return nil, fmt.Errorf("解包失败: %w", err)
+	}
+
+	res, err := s.admin.Do(Request{Cmd: CmdInspect, StagingDir: staging})
+	if err != nil {
+		return nil, fmt.Errorf("inspect: %w", err)
+	}
+	if !res.OK {
+		// 原样带上 nervud 的 code 与 message：检视被拒最常见的原因是签名无效，
+		// 那对用户是有意义的信息，不要归一化成一句「看不了」
+		return nil, fmt.Errorf("检视被拒绝 (%s): %s", res.Code, res.Message)
+	}
+	if res.Inspect == nil {
+		// OK 但没有载荷是内核契约被破坏，不是业务失败。报出来而不是回一个
+		// 空清单——空清单会被确认屏显示成「这个包不申请任何敏感权限」
+		return nil, fmt.Errorf("inspect: nervud 回了 OK 但没有 inspect 载荷")
+	}
+	return res.Inspect, nil
 }
 
 // resolveHandoff 把交接目录内的相对路径解析成绝对路径，拒绝一切逃逸。

@@ -45,6 +45,12 @@ const (
 	CmdList          = "list"
 	CmdSetEnabled    = "set-enabled"
 	CmdSetPermission = "set-permission"
+	// CmdInspect 只读检视一个已 staging 的包：返回它申请的 USER_CONSENT 权限
+	// 清单，不装、不改任何状态。
+	//
+	// 与 CmdInstall 共用同一个 staging 目录：确认屏先 inspect 再 install，
+	// 两次指的必须是同一棵树，否则中间就有一个「看的是 A、装的是 B」的缝。
+	CmdInspect = "inspect"
 )
 
 // 授予状态的 wire 表示。
@@ -53,6 +59,16 @@ const (
 	GrantStateGranted         = "granted"
 	GrantStateDenied          = "denied"
 	GrantStateDeniedPermanent = "denied-permanent"
+)
+
+// RiskClass 的 wire 表示。必须与内核 adminwire 的常量逐字一致——两份结构体没有
+// 编译期关联，写岔的后果是确认屏把一条 CRITICAL_SAFETY 权限显示成 UNSPECIFIED。
+const (
+	RiskClassUnspecified      = "unspecified"
+	RiskClassNormal           = "normal"
+	RiskClassPrivacySensitive = "privacy-sensitive"
+	RiskClassPhysicalControl  = "physical-control"
+	RiskClassCriticalSafety   = "critical-safety"
 )
 
 // 结果码。
@@ -96,6 +112,36 @@ type Response struct {
 	StagingDir string        `json:"staging_dir,omitempty"`
 	Package    *PackageInfo  `json:"package,omitempty"`
 	Packages   []PackageInfo `json:"packages,omitempty"`
+	Inspect    *InspectInfo  `json:"inspect,omitempty"`
+}
+
+// InspectInfo 是一次只读检视的结果（inspect 的产物）。
+//
+// 与 PackageInfo 刻意分开：那份描述【已装】包（有 trust 裁决结果、有已授予
+// 权限），这份描述一个【尚未安装】的候选包，两者都没有的字段含义完全不同。
+//
+// 字段与 nervud internal/adminwire 的同名结构体逐字对齐——两份结构体之间没有
+// 编译期关联，JSON tag 写岔会静默丢掉整个字段（症状是确认屏上一条权限都不显示，
+// 而用户会以为这个包不申请任何敏感权限，直接点了同意）。
+type InspectInfo struct {
+	ID          string `json:"id"`
+	Version     string `json:"version"`
+	VersionCode uint64 `json:"version_code"`
+
+	ConsentPermissions []ConsentPermissionInfo `json:"consent_permissions,omitempty"`
+}
+
+// ConsentPermissionInfo 是确认屏要展示的一条待同意权限。
+//
+// 文案由内核从 Catalog 的权限定义里取，本服务只转发：第三方包可以定义自己的
+// 权限，转发层与界面都不可能预先知道它们的名称与说明。
+type ConsentPermissionInfo struct {
+	ID              string `json:"id"`
+	DisplayNameZhCN string `json:"display_name_zh_cn,omitempty"`
+	DisplayNameEN   string `json:"display_name_en,omitempty"`
+	DescriptionZhCN string `json:"description_zh_cn,omitempty"`
+	DescriptionEN   string `json:"description_en,omitempty"`
+	RiskClass       string `json:"risk_class,omitempty"`
 }
 
 // PackageInfo 是一个已装 Package 的对外投影。
