@@ -102,6 +102,10 @@ type Request struct {
 	// 手抄副本（internal 包跨模块 import 不了），字段名对不上不会报错，
 	// 只会让同意清单静默丢失，症状是「装完了但权限还是没有」。
 	ConsentedPermissions []string `json:"consented_permissions,omitempty"`
+
+	// ExpectedManifestDigest 随 install 转发：确认屏那次 inspect 回的摘要。
+	// 本服务只转发，校验在 nervud（见 pkgregistry 的 ErrManifestDigestMismatch）。
+	ExpectedManifestDigest string `json:"expected_manifest_digest,omitempty"`
 }
 
 // Response 是 nervud 的应答。
@@ -127,6 +131,10 @@ type InspectInfo struct {
 	ID          string `json:"id"`
 	Version     string `json:"version"`
 	VersionCode uint64 `json:"version_code"`
+
+	// ManifestDigest 必须由确认屏原样带回 install，否则「看的是 A、装的是 B」
+	// 这个缝就是开着的。
+	ManifestDigest string `json:"manifest_digest,omitempty"`
 
 	ConsentPermissions []ConsentPermissionInfo `json:"consent_permissions,omitempty"`
 }

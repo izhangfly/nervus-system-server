@@ -33,7 +33,9 @@ func registerHandlers(host *sdk.ServiceHost, svc *Service, log *slog.Logger) {
 		// perm.permission.admin 的调用方放行，即系统的确认界面），而哪些条目
 		// 真正落库由 Catalog 决定。在这里加一层判断只会产生第二个真相源。
 		info, err := svc.InstallFromRelPath(
-			req.GetNspkgRelpath(), req.GetConsentedPermissions())
+			req.GetNspkgRelpath(),
+			req.GetConsentedPermissions(),
+			req.GetExpectedManifestDigest())
 		if err != nil {
 			return nil, mapErr(err, log, "install")
 		}
@@ -134,6 +136,9 @@ func inspectToProto(in *InspectInfo) *pkgv1.InspectResult {
 		PackageId:   in.ID,
 		Version:     in.Version,
 		VersionCode: in.VersionCode,
+		// 确认屏必须把它原样带回 INSTALL，否则「看的是 A、装的是 B」那个缝
+		// 就是开着的
+		ManifestDigest: in.ManifestDigest,
 		ConsentPermissions: make([]*pkgv1.RequestedPermission, 0,
 			len(in.ConsentPermissions)),
 	}
@@ -216,6 +221,12 @@ func classify(msg string) pkgv1.PackageManagerReason {
 	switch {
 	case strings.Contains(m, "signature"), strings.Contains(m, "signer"):
 		return pkgv1.PackageManagerReason_PACKAGE_MANAGER_REASON_SIGNATURE_INVALID
+	// 【必须排在 "digest" 之前】。本条的错误信息里也含 "digest"，落到下面那条
+	// 就会被说成"包坏了，请重新下载"——而真实情况是包完全有效，只是不是用户
+	// 确认过的那一份，正确的补救是重新走一次确认。
+	case strings.Contains(m, "does not match the confirmed package"),
+		strings.Contains(m, "content changed after user confirmation"):
+		return pkgv1.PackageManagerReason_PACKAGE_MANAGER_REASON_CONTENT_CHANGED
 	case strings.Contains(m, "digest"):
 		return pkgv1.PackageManagerReason_PACKAGE_MANAGER_REASON_DIGEST_MISMATCH
 	case strings.Contains(m, "downgrade"), strings.Contains(m, "version_code"):

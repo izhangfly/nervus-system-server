@@ -51,11 +51,31 @@ func newService(admin *Client, log *slog.Logger) *Service {
 	return &Service{admin: admin, log: log}
 }
 
-// dataRoot 是本服务的私有数据目录，也是与 App 交接 .nspkg 的唯一位置。
+// handoffRoot 是与 App 交接 .nspkg 的位置：跨包共享的用户文档区。
 //
-// 由内核在安装本包时创建，属主为本包 UID、权限 0700，并且是沙箱里【唯一可写】
-// 的路径（systemd 的 ReadWritePaths 只列了它）。WorkingDirectory 也是它。
-const dataRoot = "/var/lib/nervus/package-data/nervus.pkgmanagerd"
+// # 为什么不是本服务的私有目录
+//
+// 曾经是 /var/lib/nervus/package-data/nervus.pkgmanagerd —— 而那是个 0700、
+// 属主为本服务 UID 的目录，【别的包写不进去】。于是 InstallRequest 的契约
+// (「.nspkg 在调用方私有目录中的相对路径」) 与实现指的是两个不同的地方，
+// 任何 App 发起的安装都不可能成功：调用方能写的位置本服务读不到，
+// 本服务能读的位置调用方写不进。
+//
+// # 为什么是 user-data 而不是一个专用交接目录
+//
+// user-data 已经是「跨包共享的用户文件」那块地 (01777 sticky, 语义同 /tmp)，
+// 而用户下载或拷进来的 .nspkg 本来就落在这里 —— 文件管理器也在这里。再建一个
+// 专用交接目录会多出一次纯粹的复制 (App 把包从 user-data 搬到 handoff)，
+// 以及第二块要维护的共享区，换不来任何隔离：两者都是全系统可读的。
+//
+// 读取面因此只扩大到「用户自己的文件」，不碰任何包的私有数据目录。
+//
+// # 谁能走到这里
+//
+// INSTALL 方法要 perm.pkg.install。本服务不做授权判断，那由内核按
+// required_permission 裁决 —— 但正因为如此，能走到这里的调用方【已经】是被
+// 授权装包的，它指定 user-data 下哪个文件不构成额外的权限提升。
+const handoffRoot = "/var/lib/nervus/user-data"
 
 // ErrUnsafeRelPath 调用方给的路径试图逃出交接目录。
 var ErrUnsafeRelPath = errors.New("nspkg_relpath escapes the handoff directory")
@@ -70,12 +90,18 @@ var ErrUnsafeRelPath = errors.New("nspkg_relpath escapes the handoff directory")
 // 路径校验在这里做一次（拒绝绝对路径与 ".." 逃逸），nervud 侧还会再做一次。
 // 两道是有意的：本服务的进程内可能有别的 bug 把 relPath 改坏，而 nervud 那道
 // 是跨信任边界的最终防线。
-func (s *Service) InstallFromRelPath(relPath string, consented []string) (*PackageInfo, error) {
+//
+// expectedDigest 是确认屏那次 Inspect 回的 manifest 摘要，原样转发给 nervud。
+// 空表示不校验（装机脚本没有 Inspect 那一步）。本服务不比对它——比对要在验签
+// 之后、与落盘内容同一份字节上做，那些前提只有 nervud 具备。
+func (s *Service) InstallFromRelPath(
+	relPath string, consented []string, expectedDigest string,
+) (*PackageInfo, error) {
 	nspkgPath, err := resolveHandoff(relPath)
 	if err != nil {
 		return nil, err
 	}
-	return s.installFile(nspkgPath, consented)
+	return s.installFile(nspkgPath, consented, expectedDigest)
 }
 
 // InspectFromRelPath 只读检视一个 .nspkg：解包到 staging，让 nervud 验签并算出
@@ -143,11 +169,11 @@ func resolveHandoff(relPath string) (string, error) {
 	if filepath.IsAbs(relPath) {
 		return "", fmt.Errorf("%w: %q is absolute", ErrUnsafeRelPath, relPath)
 	}
-	full := filepath.Join(dataRoot, relPath)
+	full := filepath.Join(handoffRoot, relPath)
 	cleaned := filepath.Clean(full)
-	// 前缀比较【带分隔符】，否则 /var/lib/nervus/package-data/nervus.pkgmanagerd-evil
-	// 会混过朴素前缀检查。
-	if !strings.HasPrefix(cleaned, dataRoot+string(os.PathSeparator)) {
+	// 前缀比较【带分隔符】，否则 /var/lib/nervus/user-data-evil 会混过朴素
+	// 前缀检查。
+	if !strings.HasPrefix(cleaned, handoffRoot+string(os.PathSeparator)) {
 		return "", fmt.Errorf("%w: %q", ErrUnsafeRelPath, relPath)
 	}
 	return cleaned, nil
@@ -158,7 +184,9 @@ func resolveHandoff(relPath string) (string, error) {
 // consented 原样转给 nervud：本服务【不预判也不复核】它。哪些条目真正落成
 // GRANTED 由内核按 Catalog 决定（同意清单 ∩ 安装期授予集合 ∩ USER_CONSENT 的
 // 交集，越界的静默忽略），在这里筛一遍只会产生第二个会漂移的真相源。
-func (s *Service) installFile(nspkgPath string, consented []string) (*PackageInfo, error) {
+func (s *Service) installFile(
+	nspkgPath string, consented []string, expectedDigest string,
+) (*PackageInfo, error) {
 	// 1. 让 nervud 建 staging 目录。
 	//
 	// 【必须由 nervud 建，不能自己挑一个】。它保证三件事：位置与 PackageRoot
@@ -193,6 +221,9 @@ func (s *Service) installFile(nspkgPath string, consented []string) (*PackageInf
 		// 授予集合 ∩ USER_CONSENT」的交集，越界条目静默忽略，所以这里过滤
 		// 一遍只会多出一个可能与内核判据漂移的副本。
 		ConsentedPermissions: consented,
+		// 同样只转发。绑定校验在 nervud：它要在验签之后、对与落盘树逐字节一致
+		// 的那份 manifest 算摘要，本服务两个前提都不具备。
+		ExpectedManifestDigest: expectedDigest,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("install: %w", err)

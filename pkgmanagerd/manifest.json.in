@@ -9,7 +9,8 @@
   "supported_abis": ["linux-arm64"],
   "permissions": [
     "perm.service.register",
-    "perm.pkg.admin"
+    "perm.pkg.admin",
+    "perm.storage.user"
   ],
   "components": [
     {

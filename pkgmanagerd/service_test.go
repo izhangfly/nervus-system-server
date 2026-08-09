@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -39,9 +40,13 @@ func TestResolveHandoff_RejectsEscapes(t *testing.T) {
 }
 
 func TestResolveHandoff_SiblingPrefixIsNotInside(t *testing.T) {
-	// 前缀比较不带分隔符的话，一个叫 <dataRoot>-evil 的兄弟目录会混过检查。
+	// 前缀比较不带分隔符的话，一个叫 <handoffRoot>-evil 的兄弟目录会混过检查
+	// （/var/lib/nervus/user-data-evil 以 /var/lib/nervus/user-data 开头）。
 	// 这条断言锁住那个分隔符。
-	if _, err := resolveHandoff("../nervus.pkgmanagerd-evil/x.nspkg"); err == nil {
+	//
+	// 路径要跟着 handoffRoot 走：写死一个别的名字，改了交接目录之后这条测试
+	// 就不再考验它声称考验的那件事了。
+	if _, err := resolveHandoff("../" + filepath.Base(handoffRoot) + "-evil/x.nspkg"); err == nil {
 		t.Fatal("兄弟目录（同前缀）必须被拒绝")
 	}
 }
@@ -54,7 +59,7 @@ func TestResolveHandoff_AcceptsNormalPaths(t *testing.T) {
 			t.Errorf("%q 应被接受: %v", p, err)
 			continue
 		}
-		if !strings.HasPrefix(got, dataRoot+"/") {
+		if !strings.HasPrefix(got, handoffRoot+"/") {
 			t.Errorf("%q → %q，未落在交接目录内", p, got)
 		}
 	}
@@ -76,6 +81,21 @@ func TestClassify_MapsKernelMessages(t *testing.T) {
 		{"system-image package cannot be uninstalled (immutable)", pkgv1.PackageManagerReason_PACKAGE_MANAGER_REASON_IMMUTABLE},
 		{"解包失败: archive entry escapes destination", pkgv1.PackageManagerReason_PACKAGE_MANAGER_REASON_ARCHIVE_INVALID},
 		{"卸载被拒绝 (not-found): no such package", pkgv1.PackageManagerReason_PACKAGE_MANAGER_REASON_PACKAGE_NOT_FOUND},
+
+		// 确认后内容被换过。【这两条的文本里都含 "digest"】，而 classify 是
+		// 按子串顺序匹配的 —— 若这条排在 "digest" 那条之后，就会被说成
+		// 「包损坏，请重新下载」，而正确的补救是重新走一次确认。
+		//
+		// 这不是假想：nervud 回的原文正是
+		// "pkgregistry: manifest digest does not match the confirmed package"。
+		{
+			"pkgregistry: manifest digest does not match the confirmed package",
+			pkgv1.PackageManagerReason_PACKAGE_MANAGER_REASON_CONTENT_CHANGED,
+		},
+		{
+			"install 被拒绝: package content changed after user confirmation",
+			pkgv1.PackageManagerReason_PACKAGE_MANAGER_REASON_CONTENT_CHANGED,
+		},
 	}
 	for _, tc := range tests {
 		if got := classify(tc.msg); got != tc.want {
